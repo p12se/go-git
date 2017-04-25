@@ -340,11 +340,11 @@ func (r *Repository) clone(o *CloneOptions) error {
 		return err
 	}
 
-	if _, err := r.updateReferences(c.Fetch, o.ReferenceName, head); err != nil {
+	if _, err := r.updateReferences(c.Fetch, head); err != nil {
 		return err
 	}
 
-	if err := r.updateWorktree(); err != nil {
+	if err := r.updateWorktree(head.Name()); err != nil {
 		return err
 	}
 
@@ -429,7 +429,7 @@ func (r *Repository) updateRemoteConfig(remote *Remote, o *CloneOptions,
 }
 
 func (r *Repository) updateReferences(spec []config.RefSpec,
-	headName plumbing.ReferenceName, resolvedHead *plumbing.Reference) (updated bool, err error) {
+	resolvedHead *plumbing.Reference) (updated bool, err error) {
 
 	if !resolvedHead.IsBranch() {
 		// Detached HEAD mode
@@ -534,7 +534,7 @@ func (r *Repository) Pull(o *PullOptions) error {
 		return err
 	}
 
-	refsUpdated, err := r.updateReferences(remote.c.Fetch, o.ReferenceName, head)
+	refsUpdated, err := r.updateReferences(remote.c.Fetch, head)
 	if err != nil {
 		return err
 	}
@@ -547,7 +547,7 @@ func (r *Repository) Pull(o *PullOptions) error {
 		return NoErrAlreadyUpToDate
 	}
 
-	if err := r.updateWorktree(); err != nil {
+	if err := r.updateWorktree(head.Name()); err != nil {
 		return err
 	}
 
@@ -560,9 +560,14 @@ func (r *Repository) Pull(o *PullOptions) error {
 	return nil
 }
 
-func (r *Repository) updateWorktree() error {
+func (r *Repository) updateWorktree(branch plumbing.ReferenceName) error {
 	if r.wt == nil {
 		return nil
+	}
+
+	b, err := r.Reference(branch, true)
+	if err != nil {
+		return err
 	}
 
 	w, err := r.Worktree()
@@ -570,12 +575,9 @@ func (r *Repository) updateWorktree() error {
 		return err
 	}
 
-	h, err := r.Head()
-	if err != nil {
-		return err
-	}
-
-	return w.Checkout(h.Hash())
+	return w.Reset(&ResetOptions{
+		Commit: b.Hash(),
+	})
 }
 
 // Fetch fetches changes from a remote repository.
@@ -606,6 +608,26 @@ func (r *Repository) Push(o *PushOptions) error {
 	}
 
 	return remote.Push(o)
+}
+
+// Log returns the commit history from the given LogOptions.
+func (r *Repository) Log(o *LogOptions) (object.CommitIter, error) {
+	h := o.From
+	if o.From == plumbing.ZeroHash {
+		head, err := r.Head()
+		if err != nil {
+			return nil, err
+		}
+
+		h = head.Hash()
+	}
+
+	commit, err := r.CommitObject(h)
+	if err != nil {
+		return nil, err
+	}
+
+	return object.NewCommitPreIterator(commit), nil
 }
 
 // Tags returns all the References from Tags. This method returns all the tag
@@ -671,7 +693,7 @@ func (r *Repository) CommitObject(h plumbing.Hash) (*object.Commit, error) {
 }
 
 // CommitObjects returns an unsorted CommitIter with all the commits in the repository.
-func (r *Repository) CommitObjects() (*object.CommitIter, error) {
+func (r *Repository) CommitObjects() (object.CommitIter, error) {
 	iter, err := r.Storer.IterEncodedObjects(plumbing.CommitObject)
 	if err != nil {
 		return nil, err
@@ -838,29 +860,28 @@ func (r *Repository) ResolveRevision(rev plumbing.Revision) (*plumbing.Hash, err
 				commit = c
 			}
 		case revision.CaretReg:
-			history, err := commit.History()
-
-			if err != nil {
-				return &plumbing.ZeroHash, err
-			}
+			history := object.NewCommitPreIterator(commit)
 
 			re := item.(revision.CaretReg).Regexp
 			negate := item.(revision.CaretReg).Negate
 
 			var c *object.Commit
 
-			for i := 0; i < len(history); i++ {
-				if !negate && re.MatchString(history[i].Message) {
-					c = history[i]
-
-					break
+			err := history.ForEach(func(hc *object.Commit) error {
+				if !negate && re.MatchString(hc.Message) {
+					c = hc
+					return storer.ErrStop
 				}
 
-				if negate && !re.MatchString(history[i].Message) {
-					c = history[i]
-
-					break
+				if negate && !re.MatchString(hc.Message) {
+					c = hc
+					return storer.ErrStop
 				}
+
+				return nil
+			})
+			if err != nil {
+				return &plumbing.ZeroHash, err
 			}
 
 			if c == nil {
@@ -869,21 +890,21 @@ func (r *Repository) ResolveRevision(rev plumbing.Revision) (*plumbing.Hash, err
 
 			commit = c
 		case revision.AtDate:
-			history, err := commit.History()
-
-			if err != nil {
-				return &plumbing.ZeroHash, err
-			}
+			history := object.NewCommitPreIterator(commit)
 
 			date := item.(revision.AtDate).Date
+
 			var c *object.Commit
-
-			for i := 0; i < len(history); i++ {
-				if date.Equal(history[i].Committer.When.UTC()) || history[i].Committer.When.UTC().Before(date) {
-					c = history[i]
-
-					break
+			err := history.ForEach(func(hc *object.Commit) error {
+				if date.Equal(hc.Committer.When.UTC()) || hc.Committer.When.UTC().Before(date) {
+					c = hc
+					return storer.ErrStop
 				}
+
+				return nil
+			})
+			if err != nil {
+				return &plumbing.ZeroHash, err
 			}
 
 			if c == nil {
